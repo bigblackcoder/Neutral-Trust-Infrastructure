@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Independent verification of the NTI witness evidence package.
 # Requires: openssl, python3.
-# Optional: cargo + python native bindings, to re-run and re-check the suite
-#           transcript digests (step 5 is reported as SKIP without them).
+# Native SDK evidence requires an installed NTI wheel to replay step 5.
+# Cargo suites are skipped when cargo is unavailable.
 # Usage: ./verify.sh [path-to-NTI-checkout]   (default: ../..)
 set -u
 
@@ -163,7 +163,8 @@ def canonical(kind, transcript):
             if re.match(r"^test[ _].+\.\.\. (ok|FAILED|ERROR|ignored)$", s):
                 kept.append(s)
             elif (s.startswith("test result:") or s.startswith("Ran ")
-                  or s == "OK" or s.startswith("FAILED (")):
+                  or s == "OK" or s.startswith("FAILED (")
+                  or (kind == "python_unittest" and s == "NTI native Python SDK extension loaded")):
                 kept.append(strip_timing(s))
         return "\n".join(sorted(kept)) + "\n"
     errors = sum(1 for s in lines if s.startswith("error"))
@@ -189,6 +190,12 @@ for name, entry in bound.items():
     if needs_cargo and not have_cargo:
         print(f"   SKIP: {name} (cargo not on PATH)")
         skipped += 1
+        continue
+    if name == "python_unittest" and entry.get("runner") == "native_sdk_v1":
+        argv = [sys.executable, f"{py_dir}/test_python_sdk.py", "--require-native", "-v"]
+    elif name == "python_unittest" and entry.get("runner") is not None:
+        print("   FAIL: unrecognized Python SDK evidence runner")
+        bad += 1
         continue
     if argv[0] == "cargo":
         argv = [cargo_bin()] + argv[1:]

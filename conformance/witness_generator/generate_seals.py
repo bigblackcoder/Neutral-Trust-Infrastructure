@@ -30,11 +30,14 @@ an ambiguous blob. See `package_signature_input()`.
 Suite evidence
 --------------
 The generator runs the suites for real -- `cargo test --locked`, `cargo build
---locked`, `cargo check --locked --features python`, and `python -m unittest`
-over the Python SDK tests -- and binds the SHA-256 of each captured log into
+--locked`, `cargo check --locked --features python`, and the Python SDK test module
+with `--require-native` -- and binds the SHA-256 of each captured log into
 RESULTS.json (`suite_evidence`) and MANIFEST.json (`suite_evidence_logs`). A
 witness re-runs the suites and checks that the transcript digests match, so a
 "PASSED" string alone is no longer a claim without evidence.
+
+Build and install the NTI native wheel in the generator's Python environment
+before collecting witness evidence.
 
 Usage:
     python3 conformance/witness_generator/generate_seals.py \
@@ -57,7 +60,8 @@ import tempfile
 REPO = pathlib.Path(__file__).resolve().parents[2]
 GENERATOR = pathlib.Path(__file__).resolve()
 CARGO_MANIFEST = "ube-foundation/Cargo.toml"
-PYTHON_TESTS_DIR = "ube-foundation/python_tests"
+PYTHON_SDK_TEST = "ube-foundation/python_tests/test_python_sdk.py"
+NATIVE_PYTHON_MARKER = "NTI native Python SDK extension loaded"
 DOMAIN_LEAF = b"nti-s5-leaf-v1:"
 DOMAIN_NODE = b"nti-s5-node-v1:"
 DOMAIN_PACKAGE = b"nti-witness-package-v2:"
@@ -149,8 +153,8 @@ def _run(argv: list, cwd: pathlib.Path) -> dict:
 CANONICAL_FORMS = {
     "cargo_test": "sorted `test <name> ... <status>` lines plus the sorted `test result:` "
                   "summary lines with the trailing `finished in <t>` stripped",
-    "python_unittest": "sorted `test_<name> ... <status>` lines plus the `Ran N tests` line "
-                       "(timing stripped) and the final `OK`/`FAILED` line",
+    "python_unittest": "sorted native SDK marker, test outcome lines, `Ran N tests` line "
+                       "(timing stripped), and final `OK`/`FAILED` line",
     "cargo_build": "outcome only: `finished=<bool>` and `error_lines=<count>` (an incremental "
                    "build compiles a varying set of crates, so compile order is not reproducible)",
     "cargo_check": "outcome only: `finished=<bool>` and `error_lines=<count>`",
@@ -178,7 +182,8 @@ def canonicalize_transcript(kind: str, transcript: str) -> str:
             if re.match(r"^test[ _].+\.\.\. (ok|FAILED|ERROR|ignored)$", s):
                 kept.append(s)
             elif (s.startswith("test result:") or s.startswith("Ran ")
-                  or s == "OK" or s.startswith("FAILED (")):
+                  or s == "OK" or s.startswith("FAILED (")
+                  or (kind == "python_unittest" and s == NATIVE_PYTHON_MARKER)):
                 kept.append(_strip_timing(s))
         return "\n".join(sorted(kept)) + "\n"
     errors = sum(1 for s in lines if s.startswith("error"))
@@ -385,32 +390,43 @@ def update_key_history(existing: dict, fingerprint: str, now: str) -> list:
     return sorted(by_fp.values(), key=lambda e: e.get("valid_from_utc", ""))
 
 
+def run_native_python_suite() -> dict:
+    log = _run([sys.executable, PYTHON_SDK_TEST, "--require-native", "-v"], REPO)
+    lines = (log["stdout"] + log["stderr"]).splitlines()
+    native_bindings = NATIVE_PYTHON_MARKER in lines
+    passed = sum(bool(re.match(r"^test_.+\.\.\. ok$", line)) for line in lines)
+    failed = sum(bool(re.match(r"^test_.+\.\.\. (FAIL|ERROR)$", line)) for line in lines)
+    evidence = _suite_from_log(
+        log, kind="python_unittest", label="Python SDK (native extension required)",
+        ok=log["exit_code"] == 0 and native_bindings and passed > 0,
+    )
+    return {**evidence, "runner": "native_sdk_v1", "native_bindings": native_bindings,
+            "total_passed": passed, "total_failed": failed}
+
+
 def run_suites() -> dict:
     """Run the NTI suites for real and return captured evidence."""
     cargo = _bin("cargo")
-    py = _bin("python3")
 
     test_log = _run([cargo, "test", "--locked", "--manifest-path", CARGO_MANIFEST,
                      "--lib", "--tests", "--", "--nocapture"], REPO)
     build_log = _run([cargo, "build", "--locked", "--manifest-path", CARGO_MANIFEST], REPO)
     check_log = _run([cargo, "check", "--locked", "--manifest-path", CARGO_MANIFEST,
                       "--features", "python"], REPO)
-    py_log = _run([py, "-m", "unittest", "discover", "-s", PYTHON_TESTS_DIR, "-v"], REPO)
+    python_evidence = run_native_python_suite()
 
     test_transcript = test_log["stdout"] + test_log["stderr"]
     totals = parse_cargo_test_totals(test_transcript)
     rust_ok = test_log["exit_code"] == 0 and totals["failed"] == 0
-    py_ok = py_log["exit_code"] == 0
 
     return {
         "rust_totals": totals,
         "rust_ok": rust_ok,
-        "py_ok": py_ok,
         "logs": {
             "cargo_test": _suite_from_log(test_log, kind="cargo_test", label="cargo test --locked (all suites)", ok=rust_ok),
             "cargo_build": _suite_from_log(build_log, kind="cargo_build", label="cargo build --locked", ok=build_log["exit_code"] == 0),
             "cargo_check_python": _suite_from_log(check_log, kind="cargo_check", label="cargo check --locked --features python", ok=check_log["exit_code"] == 0),
-            "python_unittest": _suite_from_log(py_log, kind="python_unittest", label="python -m unittest (NTI Python SDK)", ok=py_ok),
+            "python_unittest": python_evidence,
         },
     }
 
@@ -432,7 +448,7 @@ def main():
     ap.add_argument("--key", required=True, help="Ed25519 private key (never committed)")
     ap.add_argument("--out", default="docs/witness")
     ap.add_argument("--skip-suite-runs", action="store_true",
-                    help="Reuse the suite evidence already in RESULTS.json (for re-sealing only).")
+                    help="Reuse Rust evidence for this commit. Always rerun the native Python suite.")
     args = ap.parse_args()
 
     evidence_path = pathlib.Path(args.evidence).resolve()
@@ -446,7 +462,7 @@ def main():
 
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     commit = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"],
-                            capture_output=True, text=True).stdout.strip()
+                            capture_output=True, text=True, check=True).stdout.strip()
     fingerprint = key_fingerprint(args.key)
 
     evidence_bytes = evidence_path.read_bytes()
@@ -461,20 +477,24 @@ def main():
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
 
     if args.skip_suite_runs and results.get("suite_evidence"):
-        suite = None
-        rust_totals = {"passed": results["suite_evidence"]["rust_tests"]["total_passed"],
-                       "failed": results["suite_evidence"]["rust_tests"]["total_failed"]}
-        rust_ok = results["suite_evidence"]["rust_tests"]["status"] == "PASSED"
-        py_ok = results["suite_evidence"]["python_tests"]["status"] == "PASSED"
+        if results.get("commit") != commit or manifest.get("commit") != commit:
+            ap.error("--skip-suite-runs requires existing evidence for the current commit")
+        rust_evidence = results["suite_evidence"]["rust_tests"]
+        rust_totals = {"passed": rust_evidence["total_passed"],
+                       "failed": rust_evidence["total_failed"],
+                       "binaries": next(entry["detail"] for entry in results["suites"]
+                                        if entry["id"] == "NTI-rust-tests")}
+        rust_ok = rust_evidence["status"] == "PASSED"
         logs = results["suite_evidence"]["logs"]
+        logs["python_unittest"] = run_native_python_suite()
     else:
         suite = run_suites()
-        rust_totals, rust_ok, py_ok, logs = (
-            suite["rust_totals"], suite["rust_ok"], suite["py_ok"], suite["logs"])
+        rust_totals, rust_ok, logs = suite["rust_totals"], suite["rust_ok"], suite["logs"]
 
     rust_status = "PASSED" if rust_ok else "FAILED"
-    py_status = "PASSED" if py_ok else "FAILED"
-    overall = "PASSED" if (rust_ok and py_ok) else "FAILED"
+    python_evidence = logs["python_unittest"]
+    py_status = python_evidence["status"]
+    overall = "PASSED" if rust_ok and py_status == "PASSED" else "FAILED"
     total_passed = rust_totals["passed"]
 
     results["results_version"] = 5
@@ -483,23 +503,24 @@ def main():
     results["commit"] = commit
     results["overall_status"] = overall
     results["scope"] = "NTI native suites plus S4/S5/S6 seals over a synthetic fixture."
-    results["environment"] = {"toolchain": TOOLCHAIN,
-                              "native_python_bindings": "built and loaded"}
+    results["environment"] = {
+        "toolchain": TOOLCHAIN,
+        "native_python_bindings": "loaded" if python_evidence["native_bindings"] else "not loaded",
+    }
     results["suites"] = [
         {"id": "NTI-rust-tests", "status": rust_status, "total_passed": total_passed,
          "total_failed": rust_totals["failed"], "detail": rust_totals["binaries"]},
         {"id": "NTI-python-tests", "status": py_status,
-         "command": "python3 -m unittest discover -s ube-foundation/python_tests -v",
-         "total_passed": 2 if py_ok else 0, "total_failed": 0 if py_ok else 1,
-         "native_bindings": True},
+         **{key: python_evidence[key] for key in
+            ("command", "total_passed", "total_failed", "native_bindings")}},
         {"id": "NTI-rust-build", "status": logs["cargo_build"]["status"],
          "detail": "cargo build --locked"},
         {"id": "NTI-rust-check-python-feature", "status": logs["cargo_check_python"]["status"],
          "detail": "cargo check --locked --features python"},
     ]
     results["statement"] = (
-        f"The NTI Rust suite ({total_passed} tests) and the NTI Python SDK suite were run for "
-        "this package under rustc/cargo 1.90.0 with native bindings built by maturin 1.9.6. "
+        f"The NTI Rust suite recorded {total_passed} passing tests. "
+        f"The native Python SDK check reported {py_status}. "
         "The SHA-256 digest of each suite transcript is bound in `suite_evidence`; re-run the "
         "suites and compare the digests. The S4/S5/S6 seals below are computed over a synthetic "
         "evidence fixture."
@@ -514,12 +535,7 @@ def main():
             **{k: logs["cargo_test"][k] for k in
                ("exit_code", "output_sha256", "canonical_form", "canonical_bytes", "raw_bytes")},
         },
-        "python_tests": {
-            "command": logs["python_unittest"]["command"],
-            "status": py_status,
-            **{k: logs["python_unittest"][k] for k in
-               ("exit_code", "output_sha256", "canonical_form", "canonical_bytes", "raw_bytes")},
-        },
+        "python_tests": python_evidence,
         "logs": logs,
         "note": "output_sha256 is over the canonicalised transcript (see canonical_form): outcome "
                 "lines sorted, timing stripped, so a re-run is reproducible. Re-run each command "
@@ -561,6 +577,7 @@ def main():
                "canonical_form": entry["canonical_form"]}
         for name, entry in logs.items()
     }
+    manifest["suite_evidence_logs"]["python_unittest"]["runner"] = python_evidence["runner"]
     manifest["nti_test_scripts"] = [
         {"path": path, "sha256": sha256_hex((REPO / path).read_bytes()), "description": desc}
         for path, desc in NTI_FILES

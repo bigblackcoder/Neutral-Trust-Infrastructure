@@ -1,4 +1,6 @@
+from importlib.machinery import ExtensionFileLoader
 import json
+import sys
 import unittest
 
 try:
@@ -86,4 +88,21 @@ class TestPythonSDK(unittest.TestCase):
             self.assertEqual(sig_payload["algorithm"], "Dilithium5")
 
 if __name__ == "__main__":
-    unittest.main()
+    if "--require-native" not in sys.argv:
+        unittest.main()
+
+    sys.argv.remove("--require-native")
+    try:
+        from ube_foundation import ube_foundation as native
+    except ImportError as exc:
+        sys.exit(f"Native Python SDK extension required: {exc}")
+
+    if (not isinstance(native.__spec__.loader, ExtensionFileLoader)
+            or ube_foundation.TrustEngine is not native.TrustEngine
+            or ube_foundation.PqcKeyPair is not native.PqcKeyPair):
+        sys.exit("Native Python SDK extension required for TrustEngine and PqcKeyPair")
+
+    print("NTI native Python SDK extension loaded", flush=True)
+    result = unittest.main(exit=False).result
+    sys.exit(0 if result.testsRun and result.wasSuccessful()
+             and not result.skipped and not result.expectedFailures else 1)
